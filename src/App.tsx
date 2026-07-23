@@ -1,12 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-
-function Home() {
-  return (
-    <div className="min-h-screen flex items-center justify-center text-white/60">
-      Landing page loading…
-    </div>
-  );
-}
+import Home from '@/pages/Home';
 
 export default function App() {
   return (
