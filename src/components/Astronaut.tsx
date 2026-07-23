@@ -1,558 +1,460 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState, Suspense } from 'react';
+import { Canvas, useFrame, useLoader } from '@react-three/fiber';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import * as THREE from 'three';
 import gsap from 'gsap';
 
-export default function Astronaut() {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const facingRef = useRef<HTMLDivElement>(null); // handles left/right flip
-  const bodyRef = useRef<SVGGElement>(null);
-  const headRef = useRef<SVGGElement>(null);
-  const leftEyeRef = useRef<SVGCircleElement>(null);
-  const rightEyeRef = useRef<SVGCircleElement>(null);
-  const leftLegRef = useRef<SVGGElement>(null);
-  const rightLegRef = useRef<SVGGElement>(null);
-  const leftArmRef = useRef<SVGGElement>(null);
-  const rightArmRef = useRef<SVGGElement>(null);
-  const flameRef = useRef<SVGGElement>(null);
-  const shadowRef = useRef<SVGEllipseElement>(null);
-  const dustRef = useRef<SVGGElement>(null);
-
-  const cursorRef = useRef<HTMLDivElement>(null);
-
-  // Audio
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const audioReadyRef = useRef(false);
-
-  // Position state
-  const target = useRef({ x: 0, y: 0 }); // where the cursor actually is
-  const cursorPos = useRef({ x: 0, y: 0 }); // where the visible cursor dot is (can be knocked away)
-  const cursorVel = useRef({ x: 0, y: 0 }); // recoil velocity after a kick
-  const botPos = useRef({ x: 0, y: 0 }); // where the bot is
-  const facing = useRef(1); // 1 = right, -1 = left
-  const isKicking = useRef(false);
-  const lastKickTime = useRef(0);
-  const runCycleTL = useRef<gsap.core.Timeline | null>(null);
-
-  // Init positions offscreen-ish
-  useEffect(() => {
-    const cx = window.innerWidth / 2;
-    const cy = window.innerHeight / 2;
-    target.current = { x: cx, y: cy };
-    cursorPos.current = { x: cx, y: cy };
-    botPos.current = { x: cx - 260, y: cy };
-
-    gsap.set(wrapRef.current, { x: botPos.current.x, y: botPos.current.y });
-    gsap.set(cursorRef.current, { x: cx, y: cy });
-  }, []);
-
-  // Track real cursor
-  useEffect(() => {
-    const onMove = (e: MouseEvent) => {
-      target.current.x = e.clientX;
-      target.current.y = e.clientY;
-    };
-    window.addEventListener('mousemove', onMove);
-    return () => window.removeEventListener('mousemove', onMove);
-  }, []);
-
-  // Unlock audio on first user gesture (browsers require this)
-  useEffect(() => {
-    const unlock = () => {
-      if (audioReadyRef.current) return;
-      try {
-        const AC =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        audioCtxRef.current = new AC();
-        audioReadyRef.current = true;
-      } catch {
-        // ignore — no audio available
-      }
-    };
-    window.addEventListener('pointerdown', unlock, { once: true });
-    window.addEventListener('keydown', unlock, { once: true });
-    window.addEventListener('mousemove', unlock, { once: true });
-    return () => {
-      window.removeEventListener('pointerdown', unlock);
-      window.removeEventListener('keydown', unlock);
-      window.removeEventListener('mousemove', unlock);
-    };
-  }, []);
-
-  // Play a "faah" — a short vocal-ish whoosh with a quick pitch drop
-  const playFaah = () => {
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    if (ctx.state === 'suspended') ctx.resume();
-
-    const now = ctx.currentTime;
-    const dur = 0.42;
-
-    // --- Tonal "aah" body: two detuned sawtooth oscillators through a bandpass
-    // filter that opens then closes → gives a vowel-like "faah" quality.
-    const master = ctx.createGain();
-    master.gain.setValueAtTime(0, now);
-    master.gain.linearRampToValueAtTime(0.35, now + 0.03);
-    master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-    master.connect(ctx.destination);
-
-    const bp = ctx.createBiquadFilter();
-    bp.type = 'bandpass';
-    bp.Q.value = 6;
-    // Sweep formant from ~1400Hz down to ~700Hz — like an "aah" closing
-    bp.frequency.setValueAtTime(1400, now);
-    bp.frequency.exponentialRampToValueAtTime(700, now + dur);
-    bp.connect(master);
-
-    const osc1 = ctx.createOscillator();
-    osc1.type = 'sawtooth';
-    // Pitch drop for a bratty "faah!"
-    osc1.frequency.setValueAtTime(320, now);
-    osc1.frequency.exponentialRampToValueAtTime(180, now + dur);
-    osc1.connect(bp);
-
-    const osc2 = ctx.createOscillator();
-    osc2.type = 'sawtooth';
-    osc2.detune.value = 12; // slight detune → thicker vocal texture
-    osc2.frequency.setValueAtTime(320, now);
-    osc2.frequency.exponentialRampToValueAtTime(180, now + dur);
-    osc2.connect(bp);
-
-    osc1.start(now);
-    osc2.start(now);
-    osc1.stop(now + dur + 0.05);
-    osc2.stop(now + dur + 0.05);
-
-    // --- "F" noise burst at the start — the breath/fricative in "faah"
-    const noiseDur = 0.12;
-    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * noiseDur), ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < data.length; i++) {
-      // fade the noise in and out for a natural puff
-      const t = i / data.length;
-      const env = Math.sin(Math.PI * t);
-      data[i] = (Math.random() * 2 - 1) * env;
+// ---------- Audio: synthesized "faaaaaaah" meme voice ----------
+let audioCtx: AudioContext | null = null;
+function getAudio() {
+  if (!audioCtx) {
+    try {
+      audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    } catch {
+      return null;
     }
-    const noise = ctx.createBufferSource();
-    noise.buffer = buf;
-    const noiseHP = ctx.createBiquadFilter();
-    noiseHP.type = 'highpass';
-    noiseHP.frequency.value = 2500;
-    const noiseGain = ctx.createGain();
-    noiseGain.gain.setValueAtTime(0.25, now);
-    noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + noiseDur);
-    noise.connect(noiseHP);
-    noiseHP.connect(noiseGain);
-    noiseGain.connect(ctx.destination);
-    noise.start(now);
-    noise.stop(now + noiseDur + 0.02);
-  };
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
 
-  // Running leg cycle (paused when idle/kicking)
+function playFaah() {
+  const ctx = getAudio();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const dur = 0.9;
+
+  // "F" breath burst
+  const noise = ctx.createBufferSource();
+  const buf = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+  noise.buffer = buf;
+  const nGain = ctx.createGain();
+  nGain.gain.setValueAtTime(0.35, now);
+  nGain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+  const nFilter = ctx.createBiquadFilter();
+  nFilter.type = 'highpass';
+  nFilter.frequency.value = 2000;
+  noise.connect(nFilter).connect(nGain).connect(ctx.destination);
+  noise.start(now);
+
+  // "aaaah" vocal — layered saw + square for meme-y texture
+  const freqs = [180, 360, 540];
+  freqs.forEach((f, idx) => {
+    const osc = ctx.createOscillator();
+    osc.type = idx === 0 ? 'sawtooth' : idx === 1 ? 'square' : 'triangle';
+    osc.frequency.setValueAtTime(f * 1.15, now + 0.05);
+    osc.frequency.exponentialRampToValueAtTime(f * 0.7, now + dur);
+
+    // Vibrato
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 6;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = f * 0.04;
+    lfo.connect(lfoGain).connect(osc.frequency);
+    lfo.start(now);
+    lfo.stop(now + dur);
+
+    const g = ctx.createGain();
+    const vol = idx === 0 ? 0.25 : idx === 1 ? 0.08 : 0.12;
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(vol, now + 0.08);
+    g.gain.linearRampToValueAtTime(vol * 0.9, now + dur * 0.7);
+    g.gain.exponentialRampToValueAtTime(0.001, now + dur);
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 900;
+    filter.Q.value = 3;
+
+    osc.connect(filter).connect(g).connect(ctx.destination);
+    osc.start(now + 0.05);
+    osc.stop(now + dur);
+  });
+}
+
+// ---------- 3D character model ----------
+function CharacterModel({
+  position,
+  rotationY,
+  scale,
+  animState,
+}: {
+  position: React.MutableRefObject<{ x: number; y: number; z: number }>;
+  rotationY: React.MutableRefObject<number>;
+  scale: React.MutableRefObject<number>;
+  animState: React.MutableRefObject<'idle' | 'run' | 'kick'>;
+}) {
+  const gltf = useLoader(GLTFLoader, '/models/character.glb');
+  const group = useRef<THREE.Group>(null);
+  const mixer = useRef<THREE.AnimationMixer | null>(null);
+  const walkAction = useRef<THREE.AnimationAction | null>(null);
+
   useEffect(() => {
-    const tl = gsap.timeline({ repeat: -1, paused: true });
-    tl.to(leftLegRef.current, { rotation: 30, transformOrigin: '50% 0%', duration: 0.18, ease: 'sine.inOut' }, 0)
-      .to(rightLegRef.current, { rotation: -30, transformOrigin: '50% 0%', duration: 0.18, ease: 'sine.inOut' }, 0)
-      .to(leftArmRef.current, { rotation: -25, transformOrigin: '50% 10%', duration: 0.18, ease: 'sine.inOut' }, 0)
-      .to(rightArmRef.current, { rotation: 25, transformOrigin: '50% 10%', duration: 0.18, ease: 'sine.inOut' }, 0)
-      .to(leftLegRef.current, { rotation: -30, duration: 0.18, ease: 'sine.inOut' }, 0.18)
-      .to(rightLegRef.current, { rotation: 30, duration: 0.18, ease: 'sine.inOut' }, 0.18)
-      .to(leftArmRef.current, { rotation: 25, duration: 0.18, ease: 'sine.inOut' }, 0.18)
-      .to(rightArmRef.current, { rotation: -25, duration: 0.18, ease: 'sine.inOut' }, 0.18);
-    runCycleTL.current = tl;
-
-    // Idle jetpack flame flicker
-    const flame = gsap.to(flameRef.current, {
-      scaleY: 1.3,
-      scaleX: 0.8,
-      transformOrigin: '50% 0%',
-      duration: 0.12,
-      ease: 'sine.inOut',
-      yoyo: true,
-      repeat: -1,
+    if (!gltf.scene) return;
+    // Enable shadows
+    gltf.scene.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        (obj as THREE.Mesh).castShadow = true;
+        (obj as THREE.Mesh).receiveShadow = true;
+      }
     });
+    mixer.current = new THREE.AnimationMixer(gltf.scene);
+    if (gltf.animations.length > 0) {
+      walkAction.current = mixer.current.clipAction(gltf.animations[0]);
+      walkAction.current.play();
+      walkAction.current.timeScale = 0;
+    }
+  }, [gltf]);
+
+  useFrame((_, dt) => {
+    if (!group.current) return;
+    group.current.position.set(position.current.x, position.current.y, position.current.z);
+    group.current.rotation.y = rotationY.current;
+    group.current.scale.setScalar(scale.current);
+
+    if (mixer.current && walkAction.current) {
+      // Match anim speed to state
+      const target =
+        animState.current === 'run' ? 2.5 : animState.current === 'kick' ? 3.5 : 0.6;
+      walkAction.current.timeScale += (target - walkAction.current.timeScale) * 0.15;
+      mixer.current.update(dt);
+    }
+  });
+
+  return (
+    <group ref={group}>
+      <primitive object={gltf.scene} />
+    </group>
+  );
+}
+
+function Scene({
+  position,
+  rotationY,
+  scale,
+  animState,
+}: {
+  position: React.MutableRefObject<{ x: number; y: number; z: number }>;
+  rotationY: React.MutableRefObject<number>;
+  scale: React.MutableRefObject<number>;
+  animState: React.MutableRefObject<'idle' | 'run' | 'kick'>;
+}) {
+  return (
+    <>
+      <ambientLight intensity={0.6} />
+      <directionalLight
+        position={[5, 10, 5]}
+        intensity={1.2}
+        castShadow
+        shadow-mapSize-width={1024}
+        shadow-mapSize-height={1024}
+      />
+      <pointLight position={[-5, 3, 2]} intensity={0.8} color="#a855f7" />
+      <pointLight position={[5, 3, -2]} intensity={0.6} color="#ec4899" />
+      <Suspense fallback={null}>
+        <CharacterModel
+          position={position}
+          rotationY={rotationY}
+          scale={scale}
+          animState={animState}
+        />
+      </Suspense>
+    </>
+  );
+}
+
+// ---------- Main component: chase & kick logic ----------
+export default function Astronaut() {
+  const canvasWrapRef = useRef<HTMLDivElement>(null);
+  const cursorRef = useRef<HTMLDivElement>(null);
+  const powRef = useRef<HTMLDivElement>(null);
+  const shadowRef = useRef<HTMLDivElement>(null);
+
+  const [ready, setReady] = useState(false);
+
+  // Mouse position (target the astronaut is chasing)
+  const mouse = useRef({ x: 0, y: 0 });
+  // Displayed cursor position (can recoil away from mouse when kicked)
+  const cursorPos = useRef({ x: 0, y: 0 });
+  const cursorVel = useRef({ x: 0, y: 0 });
+
+  // Astronaut screen position
+  const astroScreen = useRef({ x: 0, y: 0 });
+  // 3D world position (mapped from screen)
+  const astro3D = useRef({ x: 0, y: 0, z: 0 });
+  const astroRotY = useRef(0);
+  const astroScale = useRef(1);
+  const animState = useRef<'idle' | 'run' | 'kick'>('idle');
+
+  const kicking = useRef(false);
+  const lastKickTime = useRef(0);
+
+  useEffect(() => {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    mouse.current = { x: w / 2, y: h / 2 };
+    cursorPos.current = { x: w / 2, y: h / 2 };
+    astroScreen.current = { x: w / 2 - 200, y: h / 2 };
+
+    const onMove = (e: MouseEvent) => {
+      mouse.current.x = e.clientX;
+      mouse.current.y = e.clientY;
+      getAudio(); // unlock audio on first move
+    };
+    const onClick = () => getAudio();
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('click', onClick);
+    setReady(true);
 
     return () => {
-      tl.kill();
-      flame.kill();
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('click', onClick);
     };
   }, []);
 
-  // Main chase loop
   useEffect(() => {
+    if (!ready) return;
     let raf = 0;
-    let lastT = performance.now();
 
-    const tick = (now: number) => {
-      const dt = Math.min(0.05, (now - lastT) / 1000);
-      lastT = now;
+    const loop = () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
 
-      // Update visible cursor: apply recoil velocity with friction, then ease toward real cursor
-      cursorPos.current.x += cursorVel.current.x * dt;
-      cursorPos.current.y += cursorVel.current.y * dt;
-      cursorVel.current.x *= 0.9;
-      cursorVel.current.y *= 0.9;
+      // Cursor physics: spring back to real mouse, with recoil velocity
+      const cdx = mouse.current.x - cursorPos.current.x;
+      const cdy = mouse.current.y - cursorPos.current.y;
+      cursorVel.current.x += cdx * 0.15;
+      cursorVel.current.y += cdy * 0.15;
+      cursorVel.current.x *= 0.75;
+      cursorVel.current.y *= 0.75;
+      cursorPos.current.x += cursorVel.current.x * 0.25;
+      cursorPos.current.y += cursorVel.current.y * 0.25;
 
-      // Ease cursor dot back to real cursor position (once recoil fades)
-      const cLerp = 0.25;
-      cursorPos.current.x += (target.current.x - cursorPos.current.x) * cLerp;
-      cursorPos.current.y += (target.current.y - cursorPos.current.y) * cLerp;
-
-      gsap.set(cursorRef.current, {
-        x: cursorPos.current.x,
-        y: cursorPos.current.y,
-      });
-
-      if (!isKicking.current) {
-        // Bot chases: aim to be BEHIND the cursor relative to its direction of travel
-        // For simplicity, approach the cursor's position from wherever we are.
-        const dx = cursorPos.current.x - botPos.current.x;
-        const dy = cursorPos.current.y - botPos.current.y;
-        const dist = Math.hypot(dx, dy);
-
-        // Face the direction of motion
-        if (Math.abs(dx) > 4) {
-          const newFacing = dx > 0 ? 1 : -1;
-          if (newFacing !== facing.current) {
-            facing.current = newFacing;
-            gsap.to(facingRef.current, {
-              scaleX: newFacing,
-              duration: 0.25,
-              ease: 'power2.out',
-            });
-          }
-        }
-
-        // Speed scales with distance (feels natural)
-        const speed = Math.min(1, dist / 300) * 0.18;
-
-        // Move toward cursor, but stop a little short so we can "kick"
-        const kickRange = 90;
-        if (dist > kickRange) {
-          botPos.current.x += dx * speed;
-          botPos.current.y += dy * speed;
-
-          if (runCycleTL.current?.paused()) runCycleTL.current.play();
-        } else {
-          // In kick range — trigger a kick if we haven't recently
-          if (now - lastKickTime.current > 700) {
-            lastKickTime.current = now;
-            doKick(dx, dy);
-          }
-        }
-
-        gsap.set(wrapRef.current, {
-          x: botPos.current.x,
-          y: botPos.current.y,
-        });
+      if (cursorRef.current) {
+        cursorRef.current.style.transform = `translate(${cursorPos.current.x - 14}px, ${
+          cursorPos.current.y - 14
+        }px)`;
       }
 
-      // Eyes track the cursor
-      const edx = cursorPos.current.x - botPos.current.x;
-      const edy = cursorPos.current.y - botPos.current.y;
-      const edist = Math.hypot(edx, edy) || 1;
-      // account for facing flip so eyes look correct
-      const eyeX = (edx / edist) * 4 * facing.current;
-      const eyeY = (edy / edist) * 3;
-      gsap.to([leftEyeRef.current, rightEyeRef.current], {
-        x: eyeX,
-        y: eyeY,
-        duration: 0.3,
-        ease: 'power2.out',
-        overwrite: 'auto',
-      });
+      // Astronaut chases cursor — position himself slightly behind cursor's motion direction
+      const dxTotal = cursorPos.current.x - astroScreen.current.x;
+      const dyTotal = cursorPos.current.y - astroScreen.current.y;
+      const distToCursor = Math.hypot(dxTotal, dyTotal);
 
-      raf = requestAnimationFrame(tick);
+      if (!kicking.current) {
+        // Chase target: cursor position offset back by ~90px behind cursor motion
+        const mvx = cursorVel.current.x;
+        const mvy = cursorVel.current.y;
+        const vmag = Math.hypot(mvx, mvy) || 1;
+        const offX = -(mvx / vmag) * 100;
+        const offY = -(mvy / vmag) * 40 - 30; // stand slightly above ground line
+        const targetX = cursorPos.current.x + offX;
+        const targetY = cursorPos.current.y + offY;
+
+        const dx = targetX - astroScreen.current.x;
+        const dy = targetY - astroScreen.current.y;
+        const speed = 0.12;
+        astroScreen.current.x += dx * speed;
+        astroScreen.current.y += dy * speed;
+
+        // Face direction of movement
+        if (Math.abs(dx) > 2) {
+          const desiredRot = dx > 0 ? Math.PI / 2 : -Math.PI / 2;
+          astroRotY.current += (desiredRot - astroRotY.current) * 0.15;
+        }
+
+        // Anim state
+        const moving = Math.hypot(dx, dy);
+        animState.current = moving > 20 ? 'run' : 'idle';
+
+        // Kick trigger: close to cursor AND cursor is settled
+        const now = performance.now();
+        if (
+          distToCursor < 120 &&
+          Math.hypot(cursorVel.current.x, cursorVel.current.y) < 8 &&
+          now - lastKickTime.current > 900
+        ) {
+          triggerKick();
+          lastKickTime.current = now;
+        }
+      }
+
+      // Map screen position to 3D world
+      // Camera looks at origin from (0, 1.5, 6). Convert screen -> world.
+      const nx = (astroScreen.current.x / w) * 2 - 1;
+      const ny = -((astroScreen.current.y / h) * 2 - 1);
+      // Rough mapping so character moves in a plane
+      astro3D.current.x = nx * 4.5;
+      astro3D.current.y = ny * 2.5 - 0.8;
+      astro3D.current.z = 0;
+
+      // Shadow
+      if (shadowRef.current) {
+        shadowRef.current.style.transform = `translate(${astroScreen.current.x - 55}px, ${
+          astroScreen.current.y + 70
+        }px)`;
+      }
+
+      raf = requestAnimationFrame(loop);
     };
-
-    raf = requestAnimationFrame(tick);
+    raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [ready]);
 
-  // Kick animation — the leg swings, the cursor gets launched
-  const doKick = (dx: number, dy: number) => {
-    isKicking.current = true;
-    runCycleTL.current?.pause();
+  const triggerKick = () => {
+    kicking.current = true;
+    animState.current = 'kick';
 
-    // Reset legs/arms
-    gsap.set([leftLegRef.current, rightLegRef.current, leftArmRef.current, rightArmRef.current], {
-      rotation: 0,
-    });
+    // Direction from astronaut to cursor
+    const kx = cursorPos.current.x - astroScreen.current.x;
+    const ky = cursorPos.current.y - astroScreen.current.y;
+    const kmag = Math.hypot(kx, ky) || 1;
+    const dirX = kx / kmag;
+    const dirY = ky / kmag;
 
-    const kickLeg = facing.current === 1 ? rightLegRef.current : leftLegRef.current;
-    const kickDir = facing.current; // +1 kick right, -1 kick left
+    // Astronaut lunges into kick
+    const startX = astroScreen.current.x;
+    const startY = astroScreen.current.y;
+    const lungeX = startX + dirX * 40;
+    const lungeY = startY + dirY * 40;
 
-    // Wind up + kick + follow-through
-    const tl = gsap.timeline({
-      onComplete: () => {
-        isKicking.current = false;
-      },
-    });
-
-    // Anticipation: crouch slightly, wind up
-    tl.to(bodyRef.current, {
-      y: 6,
-      duration: 0.1,
-      ease: 'power2.out',
-    })
-      .to(
-        kickLeg,
-        {
-          rotation: -50 * kickDir,
-          transformOrigin: '50% 0%',
-          duration: 0.1,
-          ease: 'power2.out',
+    gsap
+      .timeline({
+        onComplete: () => {
+          kicking.current = false;
+          animState.current = 'run';
         },
-        '<',
-      )
-      // KICK! rapid swing
-      .to(bodyRef.current, {
-        y: -8,
-        duration: 0.09,
-        ease: 'power3.out',
       })
-      .to(
-        kickLeg,
-        {
-          rotation: 90 * kickDir,
-          duration: 0.09,
-          ease: 'power4.out',
-          onStart: () => {
-            // Launch the cursor away in the kick direction
-            const power = 900;
-            const nx = dx / (Math.hypot(dx, dy) || 1);
-            const ny = dy / (Math.hypot(dx, dy) || 1);
-            cursorVel.current.x = nx * power;
-            cursorVel.current.y = ny * power - 250; // pop up a bit
-            spawnImpact();
-            spawnDust();
-            playFaah();
-
-            // Little squash on impact
+      // Wind up
+      .to(astroScreen.current, {
+        x: startX - dirX * 15,
+        y: startY - dirY * 15,
+        duration: 0.15,
+        ease: 'power2.out',
+      })
+      // Kick lunge
+      .to(astroScreen.current, {
+        x: lungeX,
+        y: lungeY,
+        duration: 0.12,
+        ease: 'power4.in',
+        onComplete: () => {
+          // IMPACT
+          playFaah();
+          // Recoil cursor away
+          cursorVel.current.x = dirX * 90;
+          cursorVel.current.y = dirY * 90;
+          // POW burst
+          if (powRef.current) {
+            const pow = powRef.current;
+            pow.style.left = `${cursorPos.current.x}px`;
+            pow.style.top = `${cursorPos.current.y}px`;
+            pow.style.opacity = '1';
             gsap.fromTo(
-              bodyRef.current,
-              { scaleX: 1.1, scaleY: 0.9 },
-              { scaleX: 1, scaleY: 1, duration: 0.25, ease: 'elastic.out(1, 0.4)' },
+              pow,
+              { scale: 0.3, rotate: -15 },
+              {
+                scale: 1.4,
+                rotate: 15,
+                duration: 0.35,
+                ease: 'back.out(2)',
+                onComplete: () => {
+                  gsap.to(pow, { opacity: 0, duration: 0.25 });
+                },
+              }
             );
-            // Tiny screen-shake-style rotation on the bot
-            gsap.fromTo(
-              wrapRef.current,
-              { rotation: -kickDir * 8 },
-              { rotation: 0, duration: 0.4, ease: 'elastic.out(1, 0.4)' },
-            );
-          },
+          }
+          // Astronaut spin from kick momentum
+          gsap.to(astroRotY, {
+            current: astroRotY.current + (dirX > 0 ? Math.PI * 2 : -Math.PI * 2),
+            duration: 0.5,
+            ease: 'power2.out',
+          });
+          gsap.fromTo(
+            astroScale,
+            { current: 1.2 },
+            { current: 1, duration: 0.4, ease: 'elastic.out(1, 0.5)' }
+          );
         },
-        '<',
-      )
+      })
       // Recover
-      .to(kickLeg, {
-        rotation: 0,
+      .to(astroScreen.current, {
+        x: lungeX - dirX * 20,
+        y: lungeY - dirY * 20,
         duration: 0.25,
         ease: 'power2.out',
-      })
-      .to(
-        bodyRef.current,
-        {
-          y: 0,
-          duration: 0.25,
-          ease: 'power2.out',
-        },
-        '<',
-      );
-  };
-
-  // A quick impact burst overlay near the cursor
-  const spawnImpact = () => {
-    const el = document.createElement('div');
-    el.className = 'pointer-events-none fixed z-[60]';
-    el.style.left = `${cursorPos.current.x}px`;
-    el.style.top = `${cursorPos.current.y}px`;
-    el.style.width = '80px';
-    el.style.height = '80px';
-    el.style.marginLeft = '-40px';
-    el.style.marginTop = '-40px';
-    el.innerHTML = `
-      <svg viewBox="0 0 80 80" width="80" height="80">
-        <g fill="none" stroke="#fbbf24" stroke-width="3" stroke-linecap="round">
-          <line x1="40" y1="10" x2="40" y2="24" />
-          <line x1="40" y1="56" x2="40" y2="70" />
-          <line x1="10" y1="40" x2="24" y2="40" />
-          <line x1="56" y1="40" x2="70" y2="40" />
-          <line x1="18" y1="18" x2="28" y2="28" />
-          <line x1="52" y1="52" x2="62" y2="62" />
-          <line x1="62" y1="18" x2="52" y2="28" />
-          <line x1="28" y1="52" x2="18" y2="62" />
-        </g>
-        <text x="40" y="46" text-anchor="middle" font-family="Impact, sans-serif" font-size="18" fill="#fbbf24" stroke="#78350f" stroke-width="1">POW!</text>
-      </svg>
-    `;
-    document.body.appendChild(el);
-    gsap.fromTo(
-      el,
-      { scale: 0.3, opacity: 1, rotation: -20 },
-      {
-        scale: 1.4,
-        opacity: 0,
-        rotation: 20,
-        duration: 0.5,
-        ease: 'power2.out',
-        onComplete: () => el.remove(),
-      },
-    );
-  };
-
-  // Dust puff at the bot's feet
-  const spawnDust = () => {
-    const g = dustRef.current;
-    if (!g) return;
-    // Reset & animate
-    gsap.set(g, { scale: 0.5, opacity: 0.9 });
-    gsap.to(g, {
-      scale: 2,
-      opacity: 0,
-      duration: 0.5,
-      ease: 'power2.out',
-      transformOrigin: '50% 100%',
-    });
+      });
   };
 
   return (
     <>
-      {/* Custom cursor dot (the "target" that gets kicked) */}
+      {/* Hide native cursor site-wide */}
+      <style>{`* { cursor: none !important; }`}</style>
+
+      {/* Custom cursor dot */}
       <div
         ref={cursorRef}
-        className="pointer-events-none fixed left-0 top-0 z-[55]"
-        style={{ transform: 'translate(0,0)' }}
+        className="pointer-events-none fixed top-0 left-0 z-[100]"
+        style={{ willChange: 'transform' }}
       >
-        <div className="relative -translate-x-1/2 -translate-y-1/2">
-          <div className="h-5 w-5 rounded-full bg-white ring-2 ring-fuchsia-400 shadow-[0_0_20px_rgba(217,70,239,0.8)]" />
-          <div className="absolute inset-0 h-5 w-5 rounded-full bg-fuchsia-400/40 animate-ping" />
+        <div className="relative h-7 w-7">
+          <div className="absolute inset-0 rounded-full bg-pink-500 shadow-[0_0_25px_rgba(236,72,153,0.9)]" />
+          <div className="absolute inset-1.5 rounded-full bg-white/90" />
+          <div className="absolute inset-3 rounded-full bg-pink-400" />
         </div>
       </div>
 
-      {/* The kicking bot */}
+      {/* Astronaut shadow */}
       <div
-        ref={wrapRef}
-        className="pointer-events-none fixed left-0 top-0 z-40 select-none"
-        style={{ width: 140, height: 180, marginLeft: -70, marginTop: -90 }}
-        aria-label="Astronaut chasing your cursor"
+        ref={shadowRef}
+        className="pointer-events-none fixed top-0 left-0 z-[80]"
+        style={{ willChange: 'transform' }}
       >
-        <div ref={facingRef} className="h-full w-full">
-          <svg viewBox="0 0 140 180" className="h-full w-full overflow-visible">
-            <defs>
-              <radialGradient id="visorGrad2" cx="35%" cy="30%" r="70%">
-                <stop offset="0%" stopColor="#a5f3fc" />
-                <stop offset="45%" stopColor="#0891b2" />
-                <stop offset="100%" stopColor="#0c1445" />
-              </radialGradient>
-              <linearGradient id="suitGrad2" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#f8fafc" />
-                <stop offset="60%" stopColor="#cbd5e1" />
-                <stop offset="100%" stopColor="#94a3b8" />
-              </linearGradient>
-              <linearGradient id="flameGrad2" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#fef08a" />
-                <stop offset="40%" stopColor="#fb923c" />
-                <stop offset="100%" stopColor="#ef4444" stopOpacity="0" />
-              </linearGradient>
-            </defs>
+        <div className="h-4 w-28 rounded-full bg-black/40 blur-md" />
+      </div>
 
-            {/* Ground shadow */}
-            <ellipse ref={shadowRef} cx="70" cy="172" rx="30" ry="4" fill="#000" opacity="0.3" />
+      {/* 3D canvas — full screen overlay */}
+      <div
+        ref={canvasWrapRef}
+        className="pointer-events-none fixed inset-0 z-[90]"
+      >
+        <Canvas
+          shadows
+          camera={{ position: [0, 1.5, 6], fov: 45 }}
+          gl={{ alpha: true, antialias: true }}
+          style={{ background: 'transparent' }}
+        >
+          <Scene
+            position={astro3D}
+            rotationY={astroRotY}
+            scale={astroScale}
+            animState={animState}
+          />
+        </Canvas>
+      </div>
 
-            {/* Dust puff (spawns on kick) */}
-            <g ref={dustRef} opacity="0">
-              <circle cx="55" cy="170" r="6" fill="#e2e8f0" opacity="0.7" />
-              <circle cx="70" cy="168" r="8" fill="#e2e8f0" opacity="0.6" />
-              <circle cx="85" cy="170" r="6" fill="#e2e8f0" opacity="0.7" />
-            </g>
-
-            <g ref={bodyRef}>
-              {/* Jetpack flame */}
-              <g ref={flameRef}>
-                <path d="M 55 130 Q 58 148 62 160 Q 70 148 66 130 Z" fill="url(#flameGrad2)" />
-                <path d="M 74 130 Q 77 145 82 158 Q 88 145 84 130 Z" fill="url(#flameGrad2)" />
-              </g>
-
-              {/* Jetpack */}
-              <rect x="52" y="70" width="36" height="55" rx="8" fill="#475569" />
-              <rect x="56" y="74" width="10" height="47" rx="3" fill="#334155" />
-              <rect x="74" y="74" width="10" height="47" rx="3" fill="#334155" />
-              <circle cx="61" cy="82" r="2" fill="#22d3ee" />
-              <circle cx="79" cy="82" r="2" fill="#f59e0b" />
-
-              {/* Legs */}
-              <g ref={leftLegRef}>
-                <rect x="52" y="128" width="15" height="35" rx="7" fill="url(#suitGrad2)" />
-                <ellipse cx="59" cy="165" rx="10" ry="4" fill="#334155" />
-              </g>
-              <g ref={rightLegRef}>
-                <rect x="73" y="128" width="15" height="35" rx="7" fill="url(#suitGrad2)" />
-                <ellipse cx="80" cy="165" rx="10" ry="4" fill="#334155" />
-              </g>
-
-              {/* Left arm */}
-              <g ref={leftArmRef}>
-                <rect x="32" y="78" width="17" height="45" rx="8" fill="url(#suitGrad2)" />
-                <circle cx="40" cy="125" r="10" fill="#f1f5f9" stroke="#94a3b8" strokeWidth="1.5" />
-              </g>
-
-              {/* Right arm */}
-              <g ref={rightArmRef}>
-                <rect x="91" y="78" width="17" height="45" rx="8" fill="url(#suitGrad2)" />
-                <circle cx="99" cy="125" r="10" fill="#f1f5f9" stroke="#94a3b8" strokeWidth="1.5" />
-              </g>
-
-              {/* Torso */}
-              <path
-                d="M 46 75 Q 46 68 55 66 L 85 66 Q 94 68 94 75 L 94 128 Q 94 138 85 140 L 55 140 Q 46 138 46 128 Z"
-                fill="url(#suitGrad2)"
-                stroke="#94a3b8"
-                strokeWidth="1.5"
+      {/* POW burst on kick */}
+      <div
+        ref={powRef}
+        className="pointer-events-none fixed top-0 left-0 z-[110] opacity-0"
+        style={{ transform: 'translate(-50%, -50%)' }}
+      >
+        <div className="relative -translate-x-1/2 -translate-y-1/2">
+          <div className="text-5xl font-black text-yellow-300 drop-shadow-[0_0_20px_rgba(250,204,21,0.9)]">
+            POW!
+          </div>
+          <div className="absolute -inset-6 -z-10">
+            <svg viewBox="0 0 100 100" className="h-32 w-32 -translate-x-8 -translate-y-8">
+              <polygon
+                points="50,5 58,35 90,30 65,50 85,80 55,65 45,95 40,65 10,80 30,55 5,45 35,40"
+                fill="#fbbf24"
+                stroke="#f59e0b"
+                strokeWidth="3"
               />
-
-              {/* Chest panel */}
-              <rect x="58" y="88" width="24" height="18" rx="3" fill="#1e293b" />
-              <circle cx="63" cy="94" r="2" fill="#22d3ee" />
-              <circle cx="70" cy="94" r="2" fill="#a3e635" />
-              <circle cx="77" cy="94" r="2" fill="#f43f5e" />
-              <rect x="61" y="99" width="18" height="2" rx="1" fill="#22d3ee" opacity="0.8" />
-
-              {/* Head + Helmet */}
-              <g ref={headRef}>
-                <circle cx="70" cy="42" r="32" fill="#e2e8f0" stroke="#94a3b8" strokeWidth="1.5" />
-                <rect x="58" y="68" width="24" height="6" rx="2" fill="#64748b" />
-                <circle cx="70" cy="40" r="25" fill="url(#visorGrad2)" />
-                <ellipse
-                  cx="61"
-                  cy="30"
-                  rx="9"
-                  ry="5"
-                  fill="#fff"
-                  opacity="0.55"
-                  transform="rotate(-25 61 30)"
-                />
-                {/* Eyes */}
-                <circle cx="62" cy="43" r="4.5" fill="#fff" />
-                <circle cx="78" cy="43" r="4.5" fill="#fff" />
-                <circle ref={leftEyeRef} cx="62" cy="43" r="2.2" fill="#0f172a" />
-                <circle ref={rightEyeRef} cx="78" cy="43" r="2.2" fill="#0f172a" />
-                {/* Determined mouth */}
-                <path
-                  d="M 64 54 L 76 54"
-                  stroke="#0f172a"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  fill="none"
-                />
-                {/* Helmet rim */}
-                <circle cx="70" cy="42" r="32" fill="none" stroke="#cbd5e1" strokeWidth="2" />
-                <line x1="70" y1="6" x2="70" y2="0" stroke="#64748b" strokeWidth="1.5" />
-                <circle cx="70" cy="-1" r="2" fill="#ef4444">
-                  <animate attributeName="opacity" values="1;0.3;1" dur="0.8s" repeatCount="indefinite" />
-                </circle>
-              </g>
-            </g>
-          </svg>
+            </svg>
+          </div>
         </div>
       </div>
     </>
