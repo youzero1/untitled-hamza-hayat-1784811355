@@ -18,6 +18,10 @@ export default function Astronaut() {
 
   const cursorRef = useRef<HTMLDivElement>(null);
 
+  // Audio
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioReadyRef = useRef(false);
+
   // Position state
   const target = useRef({ x: 0, y: 0 }); // where the cursor actually is
   const cursorPos = useRef({ x: 0, y: 0 }); // where the visible cursor dot is (can be knocked away)
@@ -49,6 +53,99 @@ export default function Astronaut() {
     window.addEventListener('mousemove', onMove);
     return () => window.removeEventListener('mousemove', onMove);
   }, []);
+
+  // Unlock audio on first user gesture (browsers require this)
+  useEffect(() => {
+    const unlock = () => {
+      if (audioReadyRef.current) return;
+      try {
+        const AC =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        audioCtxRef.current = new AC();
+        audioReadyRef.current = true;
+      } catch {
+        // ignore — no audio available
+      }
+    };
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    window.addEventListener('mousemove', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+      window.removeEventListener('mousemove', unlock);
+    };
+  }, []);
+
+  // Play a "faah" — a short vocal-ish whoosh with a quick pitch drop
+  const playFaah = () => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const now = ctx.currentTime;
+    const dur = 0.42;
+
+    // --- Tonal "aah" body: two detuned sawtooth oscillators through a bandpass
+    // filter that opens then closes → gives a vowel-like "faah" quality.
+    const master = ctx.createGain();
+    master.gain.setValueAtTime(0, now);
+    master.gain.linearRampToValueAtTime(0.35, now + 0.03);
+    master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    master.connect(ctx.destination);
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 6;
+    // Sweep formant from ~1400Hz down to ~700Hz — like an "aah" closing
+    bp.frequency.setValueAtTime(1400, now);
+    bp.frequency.exponentialRampToValueAtTime(700, now + dur);
+    bp.connect(master);
+
+    const osc1 = ctx.createOscillator();
+    osc1.type = 'sawtooth';
+    // Pitch drop for a bratty "faah!"
+    osc1.frequency.setValueAtTime(320, now);
+    osc1.frequency.exponentialRampToValueAtTime(180, now + dur);
+    osc1.connect(bp);
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = 'sawtooth';
+    osc2.detune.value = 12; // slight detune → thicker vocal texture
+    osc2.frequency.setValueAtTime(320, now);
+    osc2.frequency.exponentialRampToValueAtTime(180, now + dur);
+    osc2.connect(bp);
+
+    osc1.start(now);
+    osc2.start(now);
+    osc1.stop(now + dur + 0.05);
+    osc2.stop(now + dur + 0.05);
+
+    // --- "F" noise burst at the start — the breath/fricative in "faah"
+    const noiseDur = 0.12;
+    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * noiseDur), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) {
+      // fade the noise in and out for a natural puff
+      const t = i / data.length;
+      const env = Math.sin(Math.PI * t);
+      data[i] = (Math.random() * 2 - 1) * env;
+    }
+    const noise = ctx.createBufferSource();
+    noise.buffer = buf;
+    const noiseHP = ctx.createBiquadFilter();
+    noiseHP.type = 'highpass';
+    noiseHP.frequency.value = 2500;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(0.25, now);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + noiseDur);
+    noise.connect(noiseHP);
+    noiseHP.connect(noiseGain);
+    noiseGain.connect(ctx.destination);
+    noise.start(now);
+    noise.stop(now + noiseDur + 0.02);
+  };
 
   // Running leg cycle (paused when idle/kicking)
   useEffect(() => {
@@ -228,6 +325,7 @@ export default function Astronaut() {
             cursorVel.current.y = ny * power - 250; // pop up a bit
             spawnImpact();
             spawnDust();
+            playFaah();
 
             // Little squash on impact
             gsap.fromTo(
