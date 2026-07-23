@@ -4,6 +4,7 @@ import Features from '@/components/Features';
 import Showcase from '@/components/Showcase';
 import CTA from '@/components/CTA';
 import Footer from '@/components/Footer';
+import Astronaut from '@/components/Astronaut';
 
 export default function Home() {
   return (
@@ -14,6 +15,9 @@ export default function Home() {
         <div className="absolute top-[40%] right-[-10%] w-[600px] h-[600px] rounded-full bg-indigo-600/20 blur-[160px]" />
         <div className="absolute bottom-[10%] left-[-10%] w-[600px] h-[600px] rounded-full bg-cyan-600/10 blur-[160px]" />
       </div>
+
+      {/* Persistent astronaut character (follows cursor, floats, waves on hover, travels on scroll) */}
+      <Astronaut />
 
       <Navbar />
       <Hero />
