@@ -1,5 +1,5 @@
 ---
-status: pending
+status: implemented
 title: Leaderboard, Power-Up Sounds, and Title Screen
 ---
 
